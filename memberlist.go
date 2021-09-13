@@ -38,7 +38,7 @@ type Memberlist struct {
 	sequenceNum uint32 // Local sequence number
 	incarnation uint32 // Local incarnation number
 	numNodes    uint32 // Number of known nodes (estimate)
-	pushPullReq uint32 // Number of push/pull requests
+	pushPullReq uint32 // Number of push/pull requests  // 用于限制并发进行的同步操作的数量
 
 	advertiseLock sync.RWMutex
 	advertiseAddr net.IP
@@ -55,6 +55,7 @@ type Memberlist struct {
 
 	transport NodeAwareTransport
 
+	// 用户消息类型拥有优先级的区分。比如对于 alive 消息则优先级较高。
 	handoffCh            chan struct{}
 	highPriorityMsgQueue *list.List
 	lowPriorityMsgQueue  *list.List
@@ -132,6 +133,7 @@ func newMemberlist(conf *Config) (*Memberlist, error) {
 
 	// Set up a network transport by default if a custom one wasn't given
 	// by the config.
+	// 设置网络通信传输框架
 	transport := conf.Transport
 	if transport == nil {
 		nc := &NetTransportConfig{
@@ -187,6 +189,7 @@ func newMemberlist(conf *Config) (*Memberlist, error) {
 		nodeAwareTransport = &shimNodeAwareTransport{transport}
 	}
 
+	// 创建 Memberlist 结构
 	m := &Memberlist{
 		config:               conf,
 		shutdownCh:           make(chan struct{}),
@@ -202,7 +205,7 @@ func newMemberlist(conf *Config) (*Memberlist, error) {
 		broadcasts:           &TransmitLimitedQueue{RetransmitMult: conf.RetransmitMult},
 		logger:               logger,
 	}
-	m.broadcasts.NumNodes = func() int {
+	m.broadcasts.NumNodes = func() int { // 设置获取集群成员数量的方法
 		return m.estNumNodes()
 	}
 
@@ -213,8 +216,11 @@ func newMemberlist(conf *Config) (*Memberlist, error) {
 		return nil, err
 	}
 
+	// 循环监听 tcp 连接，并将读取到的连接交给处理函数进行处理，启动对应的 tcp 消息的处理循环
 	go m.streamListen()
+	// 循环监听 udp 包，并将读取到的数据包交给处理函数进行处理
 	go m.packetListen()
+	// 启动 udp 网络包各种类型的消息处理器
 	go m.packetHandler()
 	return m, nil
 }

@@ -43,6 +43,7 @@ type Config struct {
 	// operations. This is a legacy name for backwards compatibility, but
 	// should really be called StreamTimeout now that we have generalized
 	// the transport.
+	// tcp 全量状态同步连接建立以及 tcp 连接读取和写入的超时时限
 	TCPTimeout time.Duration
 
 	// IndirectChecks is the number of nodes that will be asked to perform

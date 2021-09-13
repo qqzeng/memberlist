@@ -219,13 +219,15 @@ func (m *Memberlist) streamListen() {
 }
 
 // handleConn handles a single incoming stream connection from the transport.
+// handleConn 处理 tcp 连接
 func (m *Memberlist) handleConn(conn net.Conn) {
 	defer conn.Close()
 	m.logger.Printf("[DEBUG] memberlist: Stream connection %s", LogConn(conn))
 
 	metrics.IncrCounter([]string{"memberlist", "tcp", "accept"}, 1)
 
-	conn.SetDeadline(time.Now().Add(m.config.TCPTimeout))
+	conn.SetDeadline(time.Now().Add(m.config.TCPTimeout)) // 设置连接处理超时时限
+	// 执行消息的解密和解压缩操作，以获取原始消息类型和内容，若操作失败，则向连接中写入操作失败数据
 	msgType, bufConn, dec, err := m.readStream(conn)
 	if err != nil {
 		if err != io.EOF {
@@ -247,38 +249,50 @@ func (m *Memberlist) handleConn(conn net.Conn) {
 		return
 	}
 
+	// 根据消息原始类型进行针对性处理，
 	switch msgType {
+	// 用户自定义消息，则从 tcp 流中依次读取消息头（包含消息长度）以及消息内容。
+	// 最后调用 Delegate.NotifyUser 来通知上层应用收到一条用户消息。
 	case userMsg:
 		if err := m.readUserMsg(bufConn, dec); err != nil {
 			m.logger.Printf("[ERR] memberlist: Failed to receive user message: %s %s", err, LogConn(conn))
 		}
+	// push -> pull -> merge 操作消息。
 	case pushPullMsg:
 		// Increment counter of pending push/pulls
 		numConcurrent := atomic.AddUint32(&m.pushPullReq, 1)
 		defer atomic.AddUint32(&m.pushPullReq, ^uint32(0))
-
+		// 若发现同时进行的同步操作的数量过多，则直接返回错误。
 		// Check if we have too many open push/pull requests
 		if numConcurrent >= maxPushPullRequests {
 			m.logger.Printf("[ERR] memberlist: Too many pending push/pull requests")
 			return
 		}
-
+		// 否则，首先从连接中读取消息头，然后依次读取节点信息，或者用户状态数据。
 		join, remoteNodes, userState, err := m.readRemoteState(bufConn, dec)
 		if err != nil {
 			m.logger.Printf("[ERR] memberlist: Failed to read remote state: %s %s", err, LogConn(conn))
 			return
 		}
-
+		// 发送节点本地的集群成员视图数据。
+		// 首先封装本地的集群成员视图数量，然后调用上层应用的 hook 方法来获取需要被发送的数据（针对远程节点加入，可针对性发送数据）。
+		// 依次向连接中写入消息类型、消息头就是集群成员视图数据以及上层应用需要发送的数据。
+		// 最后通过 rawSendMsgStream 将连接中数据正式发送（消息可能需要被加密和压缩，若配置）。
 		if err := m.sendLocalState(conn, join); err != nil {
 			m.logger.Printf("[ERR] memberlist: Failed to push local state: %s %s", err, LogConn(conn))
 			return
 		}
-
+		// 将从远程节点收到的数据同本地状态数据进行合并。
+		// 首先执行远程节点集合的支持协议范围约束的检查，然后回调上层应用在执行状态数据的 merge 操作时自定义的逻辑，
+		// 接下来，正式合并远程节点发来的每一个节点的数据，即根据节点的状态执行对应的消息的处理器，即当作自身收到对应类型的消息时的处理逻辑。
+		// 最后，执行上层应用在节点完成一个 push/pull 消息的处理时需额外进行的操作。
 		if err := m.mergeRemoteState(join, remoteNodes, userState); err != nil {
 			m.logger.Printf("[ERR] memberlist: Failed push/pull merge: %s %s", err, LogConn(conn))
 			return
 		}
+	// Ping 消息。
 	case pingMsg:
+		// 当收到一条 ping 消息，直接返回一条 ack 消息。
 		var p ping
 		if err := dec.Decode(&p); err != nil {
 			m.logger.Printf("[ERR] memberlist: Failed to decode ping: %s %s", err, LogConn(conn))
@@ -321,6 +335,7 @@ func (m *Memberlist) packetListen() {
 	}
 }
 
+// ingestPacket 主要对 udp 数据报尝试解密，以及 md5 校验操作，最后调用真正处理消息的方法 handleCommand
 func (m *Memberlist) ingestPacket(buf []byte, from net.Addr, timestamp time.Time) {
 	// Check if encryption is enabled
 	if m.config.EncryptionEnabled() {
@@ -354,6 +369,7 @@ func (m *Memberlist) ingestPacket(buf []byte, from net.Addr, timestamp time.Time
 	}
 }
 
+// handleCommand 消息处理的分发入口，即根据消息的不同类型，调用对应类型的消息的处理器。
 func (m *Memberlist) handleCommand(buf []byte, from net.Addr, timestamp time.Time) {
 	if len(buf) < 1 {
 		m.logger.Printf("[ERR] memberlist: missing message type byte %s", LogAddress(from))
@@ -1038,11 +1054,13 @@ func (m *Memberlist) decryptRemoteState(bufConn io.Reader) ([]byte, error) {
 
 // readStream is used to read from a stream connection, decrypting and
 // decompressing the stream if necessary.
+// readStream 连接中读取消息，主要是执行消息的解密和解压缩操作，以获取原始消息的类型和内容
 func (m *Memberlist) readStream(conn net.Conn) (messageType, io.Reader, *codec.Decoder, error) {
 	// Created a buffered reader
 	var bufConn io.Reader = bufio.NewReader(conn)
 
 	// Read the message type
+	// 消息的首个字节表示消息的类型
 	buf := [1]byte{0}
 	if _, err := bufConn.Read(buf[:]); err != nil {
 		return 0, nil, nil, err
@@ -1050,6 +1068,8 @@ func (m *Memberlist) readStream(conn net.Conn) (messageType, io.Reader, *codec.D
 	msgType := messageType(buf[0])
 
 	// Check if the message is encrypted
+	// 若消息被加密，则首先尝试解密，并得到解密后的真正的消息类型
+	// 若需要对消息进行加密，则通信的双方都需要设置密钥以及加密模式
 	if msgType == encryptMsg {
 		if !m.config.EncryptionEnabled() {
 			return 0, nil, nil,
@@ -1073,6 +1093,7 @@ func (m *Memberlist) readStream(conn net.Conn) (messageType, io.Reader, *codec.D
 	hd := codec.MsgpackHandle{}
 	dec := codec.NewDecoder(bufConn, &hd)
 
+	// 若为压缩消息，则进行解压，读取真正的消息类型
 	// Check if we have a compressed message
 	if msgType == compressMsg {
 		var c compress

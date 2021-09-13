@@ -27,11 +27,13 @@ type Delegate interface {
 	// the remote side in addition to the membership information. Any
 	// data can be sent here. See MergeRemoteState as well. The `join`
 	// boolean indicates this is for a join instead of a push/pull.
+	// LocalState 返回用户在处理 pushPullMsg 时上层应用需要发送的用户数据。
 	LocalState(join bool) []byte
 
 	// MergeRemoteState is invoked after a TCP Push/Pull. This is the
 	// state received from the remote side and is the result of the
 	// remote side's LocalState call. The 'join'
 	// boolean indicates this is for a join instead of a push/pull.
+	// MergeRemoteState 执行在节点完成一个 push/pull 消息的处理时，上层应用需要额外进行的操作。
 	MergeRemoteState(buf []byte, join bool)
 }
