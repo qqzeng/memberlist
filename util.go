@@ -180,6 +180,8 @@ func makeCompoundMessage(msgs [][]byte) *bytes.Buffer {
 // decodeCompoundMessage splits a compound message and returns
 // the slices of individual messages. Also returns the number
 // of truncated messages and any potential error
+// decodeCompoundMessage 解码 compound 消息，依次从数据中读取总的消息数、每个消息的长度、以及每个消息的内容。
+// 若在任一环节出错，则返回错误，否则返回解码后的消息数组。
 func decodeCompoundMessage(buf []byte) (trunc int, parts [][]byte, err error) {
 	if len(buf) < 1 {
 		err = fmt.Errorf("missing compound length byte")
@@ -242,6 +244,7 @@ func compressPayload(inp []byte) (*bytes.Buffer, error) {
 
 // decompressPayload is used to unpack an encoded compress{}
 // message and return its payload uncompressed
+// decompressPayload 首先解码消息，然后使用特定算法解密消息内容，并返回
 func decompressPayload(msg []byte) ([]byte, error) {
 	// Decode the message
 	var c compress

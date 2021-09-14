@@ -220,7 +220,7 @@ func newMemberlist(conf *Config) (*Memberlist, error) {
 	go m.streamListen()
 	// 循环监听 udp 包，并将读取到的数据包交给处理函数进行处理
 	go m.packetListen()
-	// 启动 udp 网络包各种类型的消息处理器
+	// 启动 udp 网络包各种类型消息的的消息处理器
 	go m.packetHandler()
 	return m, nil
 }

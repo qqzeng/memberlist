@@ -382,19 +382,27 @@ func (m *Memberlist) handleCommand(buf []byte, from net.Addr, timestamp time.Tim
 	// Switch on the msgType
 	switch msgType {
 	case compoundMsg:
+		// compound 消息，复合消息类型。
 		m.handleCompound(buf, from, timestamp)
 	case compressMsg:
+		// compressed 消息，复合消息类型。
 		m.handleCompressed(buf, from, timestamp)
-
+	// ping 消息。
 	case pingMsg:
 		m.handlePing(buf, from)
+	// indirectPing 消息。
 	case indirectPingMsg:
 		m.handleIndirectPing(buf, from)
+	// ack 消息。
 	case ackRespMsg:
 		m.handleAck(buf, from, timestamp)
+	// nack 消息。
 	case nackRespMsg:
 		m.handleNack(buf, from)
 
+	// 针对 suspect、alive、dead 以及 user 消息，会将其放入高或低优先级队列中。
+	// 高优先级队列中的消息会被优先处理。
+	// 并且每个队列会被设置一个队列长度上限，一旦超过此上限，则直接丢弃该消息。
 	case suspectMsg:
 		fallthrough
 	case aliveMsg:
@@ -448,11 +456,14 @@ func (m *Memberlist) getNextMessage() (msgHandoff, bool) {
 // packetHandler is a long running goroutine that processes messages received
 // over the packet interface, but is decoupled from the listener to avoid
 // blocking the listener which may cause ping/ack messages to be delayed.
+// packetHandler 专门处理 suspect、alive、dead 以及 user 类型的消息。
+// 当从通道中读取到数据时，即表示有消息到达。
 func (m *Memberlist) packetHandler() {
 	for {
 		select {
 		case <-m.handoffCh:
 			for {
+				// 依次尝试从维护的高和低两个优先级队列中以 LIFO 的顺序获取消息。
 				msg, ok := m.getNextMessage()
 				if !ok {
 					break
@@ -460,7 +471,7 @@ func (m *Memberlist) packetHandler() {
 				msgType := msg.msgType
 				buf := msg.buf
 				from := msg.from
-
+				// 根据消息的类型调用对应的处理器
 				switch msgType {
 				case suspectMsg:
 					m.handleSuspect(buf, from)
@@ -481,6 +492,8 @@ func (m *Memberlist) packetHandler() {
 	}
 }
 
+// 解码 compound 消息，依次从数据中读取总的消息数、每个消息的长度、以及每个消息的内容。
+// 若存在截断的消息，则直接返回错误，否则再回调 handleCommand 来依次处理每一个消息。
 func (m *Memberlist) handleCompound(buf []byte, from net.Addr, timestamp time.Time) {
 	// Decode the parts
 	trunc, parts, err := decodeCompoundMessage(buf)
@@ -500,6 +513,8 @@ func (m *Memberlist) handleCompound(buf []byte, from net.Addr, timestamp time.Ti
 	}
 }
 
+// handlePing 首先对消息解码，并进行校验。然后，调用上层应用 hook 的接口以获取需要附加到 ack 消息的内容。
+// 最后构建 ack 消息，并将消息通过 encodeAndSendMsg 发送出去。
 func (m *Memberlist) handlePing(buf []byte, from net.Addr) {
 	var p ping
 	if err := decode(buf, &p); err != nil {
@@ -533,6 +548,12 @@ func (m *Memberlist) handlePing(buf []byte, from net.Addr) {
 	}
 }
 
+// 首先对消息解码后获取消息详情，然后转换消息的发送者并构建  ping 消息。
+// 接下来，构建 ping 消息的成功响应处理函数，即将 ack 消息转发给 indirectPing 消息的发送者。
+// 然后将此处理函数设置到 indirect ping 处理器集合中，其会在超时时限内将该处理器从该集合中删除。
+// 接下来，发送该 ping 消息。
+// 并设置一个超时处理器在对端超时未响应时，且源端是需要一个 nack，则发送一个 nack 消息。
+// 注意由 indirectPing 消息产生的 ping 消息以及回复给源端的 ack 或 nack 消息都会同其它排除缓存中的消息一起构建为 compound 消息发送出去。
 func (m *Memberlist) handleIndirectPing(buf []byte, from net.Addr) {
 	var ind indirectPingReq
 	if err := decode(buf, &ind); err != nil {
@@ -615,6 +636,9 @@ func (m *Memberlist) handleIndirectPing(buf []byte, from net.Addr) {
 	}
 }
 
+// 处理 ack 消息的逻辑比较简单，即根据消息序号从响应消息处理器集合中获取之前设置的消息处理器即可，
+// 然后传入响应体和时间戳以调用该处理器， 调用完后，立即将该处理器销毁掉。、
+// 若此 ack handler 超时未被调用，也会被自动移除。
 func (m *Memberlist) handleAck(buf []byte, from net.Addr, timestamp time.Time) {
 	var ack ackResp
 	if err := decode(buf, &ack); err != nil {
@@ -624,6 +648,7 @@ func (m *Memberlist) handleAck(buf []byte, from net.Addr, timestamp time.Time) {
 	m.invokeAckHandler(ack, timestamp)
 }
 
+// nack 消息的逻辑同 ack 消息的逻辑非常类似。都是通过回调 handler 的形式来处理的。
 func (m *Memberlist) handleNack(buf []byte, from net.Addr) {
 	var nack nackResp
 	if err := decode(buf, &nack); err != nil {
@@ -711,6 +736,7 @@ func (m *Memberlist) handleUser(buf []byte, from net.Addr) {
 }
 
 // handleCompressed is used to unpack a compressed message
+// handleCompressed 首先解码消息，然后使用特定算法解密消息内容。最后再回调 handleCommand 函数来处理解压后的基础消息。
 func (m *Memberlist) handleCompressed(buf []byte, from net.Addr, timestamp time.Time) {
 	// Try to decode the payload
 	payload, err := decompressPayload(buf)
@@ -737,6 +763,8 @@ func (m *Memberlist) encodeAndSendMsg(a Address, msgType messageType, msg interf
 
 // sendMsg is used to send a message via packet to another host. It will
 // opportunistically create a compoundMsg and piggy back other broadcasts.
+// sendMsg 会尝试构建一个 compoundMsg，并从排队缓存的广播消息集合中取出若干个消息，
+// 以尽可能使得此 compoundMsg 接近 udp 消息的额外网络包大小，最后才将消息发送给对端。
 func (m *Memberlist) sendMsg(a Address, msg []byte) error {
 	// Check if we can piggy back any messages
 	bytesAvail := m.config.UDPBufferSize - len(msg) - compoundHeaderOverhead
