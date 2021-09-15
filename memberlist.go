@@ -63,7 +63,7 @@ type Memberlist struct {
 
 	nodeLock   sync.RWMutex
 	nodes      []*nodeState          // Known nodes
-	nodeMap    map[string]*nodeState // Maps Node.Name -> NodeState
+	nodeMap    map[string]*nodeState // Maps Node.Name -> NodeState // 当前节点的集群节点列表视图
 	nodeTimers map[string]*suspicion // Maps Node.Name -> suspicion timer
 	awareness  *awareness
 

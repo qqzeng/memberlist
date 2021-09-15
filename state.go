@@ -58,6 +58,7 @@ func (n *Node) String() string {
 }
 
 // NodeState is used to manage our state view of another node
+// NodeState 用于保存当前节点对集群中其它节点的一个视图数据
 type nodeState struct {
 	Node
 	Incarnation uint32        // Last known incarnation number
@@ -886,15 +887,20 @@ func (m *Memberlist) invokeNackHandler(nack nackResp) {
 // accusedInc value, or you can supply 0 to just get the next incarnation number.
 // This alters the node state that's passed in so this MUST be called while the
 // nodeLock is held.
+// refute 通过广播一条 alive 消息来驳斥其它节点针对自身的 suspect 或者 dead 消息。
 func (m *Memberlist) refute(me *nodeState, accusedInc uint32) {
 	// Make sure the incarnation number beats the accusation.
+	// 首先递增自身的的 incarnation，以保证该值大于其它节点为自己保存的该值，否则将不能驳斥成功。
 	inc := m.nextIncarnation()
+	// 若其它节点为自己保存的 incarnation 仍旧大于递增后的值，则进一步增加 incarnation 直至大于它。
 	if accusedInc >= inc {
 		inc = m.skipIncarnation(accusedInc - inc + 1)
 	}
 	me.Incarnation = inc
 
 	// Decrease our health because we are being asked to refute a problem.
+	// 减少自己的 awareness 值，考虑到其它节点认为自己是处于 suspect 或者  dead 状态，但实际上自己并没有处于该状态，
+	// 因此可能是自己的
 	m.awareness.ApplyDelta(1)
 
 	// Format and broadcast an alive message.
@@ -914,6 +920,7 @@ func (m *Memberlist) refute(me *nodeState, accusedInc uint32) {
 
 // aliveNode is invoked by the network layer when we get a message about a
 // live node.
+// alive 消息的处理逻辑。
 func (m *Memberlist) aliveNode(a *alive, notify chan struct{}, bootstrap bool) {
 	m.nodeLock.Lock()
 	defer m.nodeLock.Unlock()
@@ -923,10 +930,13 @@ func (m *Memberlist) aliveNode(a *alive, notify chan struct{}, bootstrap bool) {
 	// in-queue to be processed but blocked by the locks above. If we let
 	// that aliveMsg process, it'll cause us to re-join the cluster. This
 	// ensures that we don't.
+	// 当节点自身主动离开集群的同时，存在一条 alive 消息未被此处理，
+	// 则此时应该进一步检测，若属于此情况，则应该直接返回。
 	if m.hasLeft() && a.Node == m.config.Name {
 		return
 	}
 
+	// 协议兼容性检查
 	if len(a.Vsn) >= 3 {
 		pMin := a.Vsn[0]
 		pMax := a.Vsn[1]
@@ -941,6 +951,7 @@ func (m *Memberlist) aliveNode(a *alive, notify chan struct{}, bootstrap bool) {
 	// alive messages based on custom logic. For example, using a cluster name.
 	// Using a merge delegate is not enough, as it is possible for passive
 	// cluster merging to still occur.
+	// 调用上层应用的 alive hook 处理器。这可基于自定义的逻辑来过滤 alive 消息。
 	if m.config.Alive != nil {
 		if len(a.Vsn) < 6 {
 			m.logger.Printf("[WARN] memberlist: ignoring alive message for '%s' (%v:%d) because Vsn is not present",
@@ -968,6 +979,9 @@ func (m *Memberlist) aliveNode(a *alive, notify chan struct{}, bootstrap bool) {
 
 	// Check if we've never seen this node before, and if not, then
 	// store this node in our node map.
+	// 若将节点先前不存在于节点本地的视图中，则先构造一个节点对象并存储。
+	// 然后，生成一个随机的索引位置，用于放置该节点，这可以保证节点执行随机探测时任一节点被探测的延时存在上限。
+	// 最后更新当前集群中成员数目。
 	var updatesNode bool
 	if !ok {
 		errCon := m.config.IPAllowed(a.Addr)
@@ -1010,6 +1024,12 @@ func (m *Memberlist) aliveNode(a *alive, notify chan struct{}, bootstrap bool) {
 		// Update numNodes after we've added a new node
 		atomic.AddUint32(&m.numNodes, 1)
 	} else {
+		// 若节点已存在于节点本地集群成员视图中。
+		// 则进一步判断 alive 消息中存在的节点元信息（如 ip 地址或端口）是否和本地保存的对应节点的元信息冲突，
+		// 若产生冲突，则需进一步判断节点是否允许更新其元信息，
+		// 显然，只有节点处于 left 或者 dead 状态，且协议被配置为允许节点回收（即节点的名称重复使用必须间隔指定时间），
+		// 节点才会更新 alive 消息中包含的节点在本地存储的元信息和状态，
+		// 相反若配置为不允许更新节点状态，则回调上层应用的 Conflict hook 处理器，直接中止后续处理流程。
 		// Check if this address is different than the existing node unless the old node is dead.
 		if !bytes.Equal([]byte(state.Addr), a.Addr) || state.Port != a.Port {
 			errCon := m.config.IPAllowed(a.Addr)
@@ -1046,17 +1066,20 @@ func (m *Memberlist) aliveNode(a *alive, notify chan struct{}, bootstrap bool) {
 	}
 
 	// Bail if the incarnation number is older, and this is not about us
+	// 当节点的 incarnation 的值小于本节点为其存在的值，并且目标节点并非自身，同时也并未执行节点信息变更时，则直接退出。
 	isLocalNode := state.Name == m.config.Name
 	if a.Incarnation <= state.Incarnation && !isLocalNode && !updatesNode {
 		return
 	}
 
 	// Bail if strictly less and this is about us
+	// 当节点的 incarnation 的值小于本节点为其存在的值，并且目标节点即为自身，同样直接退出。
 	if a.Incarnation < state.Incarnation && isLocalNode {
 		return
 	}
 
 	// Clear out any suspicion timer that may be in effect.
+	// 先清除节点的 suspect 定时器，若存在的话。因为该节点收到了目标节点的 alive 消息。
 	delete(m.nodeTimers, a.Node)
 
 	// Store the old state and meta data
@@ -1064,6 +1087,8 @@ func (m *Memberlist) aliveNode(a *alive, notify chan struct{}, bootstrap bool) {
 	oldMeta := state.Meta
 
 	// If this is us we need to refute, otherwise re-broadcast
+	// 若发现此 alive 消息正是针对节点自身，且并不是节点自身在启动时加入集群时发出的，
+	// 则节点可能需要执行 refute 操作，即向集群中广播 alive 消息，以公告自己仍然处于存活状态。
 	if !bootstrap && isLocalNode {
 		// Compute the version vector
 		versions := []uint8{
@@ -1090,6 +1115,9 @@ func (m *Memberlist) aliveNode(a *alive, notify chan struct{}, bootstrap bool) {
 		m.refute(state, a.Incarnation)
 		m.logger.Printf("[WARN] memberlist: Refuting an alive message for '%s' (%v:%d) meta:(%v VS %v), vsn:(%v VS %v)", a.Node, net.IP(a.Addr), a.Port, a.Meta, state.Meta, a.Vsn, versions)
 	} else {
+		// 相反，若发现此 aliveMsg 同自身无关，或者即使此消息同自身相关，
+		// 但也并非在节点启动加入集群时发出的，此时直接将此 aliveMsg 广播到集群。
+		// 最后更新本节点为目标节点存储的元信息，如 incarnation 值，状态更新时间等。
 		m.encodeBroadcastNotify(a.Node, aliveMsg, a, notify)
 
 		// Update protocol versions if it arrived
@@ -1117,6 +1145,9 @@ func (m *Memberlist) aliveNode(a *alive, notify chan struct{}, bootstrap bool) {
 	metrics.IncrCounter([]string{"memberlist", "msg", "alive"}, 1)
 
 	// Notify the delegate of any relevant updates
+	// 若上层应用定义了节点状态变化的 hook，则需要回调它们。
+	// 节点状态变化分为节点的存活状态变化：  dead/left -> alive，
+	// 以及节点的元信息发生变化。
 	if m.config.Events != nil {
 		if oldState == StateDead || oldState == StateLeft {
 			// if Dead/Left -> Alive, notify of join
@@ -1137,11 +1168,15 @@ func (m *Memberlist) suspectNode(s *suspect) {
 	state, ok := m.nodeMap[s.Node]
 
 	// If we've never heard about this node before, ignore it
+	// 若被 suspect 的节点平不存在于当前节点的集群节点列表视图中，则忽略该消息。
+	// 说明该消息可能已被处理过。
 	if !ok {
 		return
 	}
 
 	// Ignore old incarnation numbers
+	// 类似地，若被 suspect 的节点的 incarnation 值小于当前节点为该 suspect 保存的 incarnation 值，同样忽略该消息。
+	// 说明该消息已经过时了。
 	if s.Incarnation < state.Incarnation {
 		return
 	}
@@ -1150,6 +1185,9 @@ func (m *Memberlist) suspectNode(s *suspect) {
 	// to us we will go ahead and re-gossip it. This allows for multiple
 	// independent confirmations to flow even when a node probes a node
 	// that's already suspect.
+	// 若当前节点已为目标节点保存了对应的 suspect timer，则当收到其它节点的针对目标节点的 suspect 消息时，
+	// 执行 confirm 动作，表明进一步“肯定”目标节点处于 dead 状态。
+	// 然后将此 suspect 发送到需要被广播的消息缓存队列中，随后会被广播出去。
 	if timer, ok := m.nodeTimers[s.Node]; ok {
 		if timer.Confirm(s.From) {
 			m.encodeAndBroadcast(s.Node, suspectMsg, s)
@@ -1158,11 +1196,14 @@ func (m *Memberlist) suspectNode(s *suspect) {
 	}
 
 	// Ignore non-alive nodes
+	// 若当前节点已非 alive 状态，则忽略它。因为在当前节点看来，该节点已经处于 suspect 或 dead 的状态，不需要后续处理。
 	if state.State != StateAlive {
 		return
 	}
 
 	// If this is us we need to refute, otherwise re-broadcast
+	// 若恰好发现目标节点就是当前节点自身，则显然，自身还是存活的，因此需要立即发送一条 refute 消息以驳斥该 suspect 消息。
+	// 否则，将该 suspect 消息发送到需要被广播的消息缓存队列中，随后会被广播出去。
 	if state.Name == m.config.Name {
 		m.refute(state, s.Incarnation)
 		m.logger.Printf("[WARN] memberlist: Refuting a suspect message (from: %s)", s.From)
@@ -1175,6 +1216,7 @@ func (m *Memberlist) suspectNode(s *suspect) {
 	metrics.IncrCounter([]string{"memberlist", "msg", "suspect"}, 1)
 
 	// Update the state
+	// 更新当前节点为目标节点保存的 incarnation 值，目标节点的状态、目标节点状态更新时间
 	state.Incarnation = s.Incarnation
 	state.State = StateSuspect
 	changeTime := time.Now()
@@ -1184,19 +1226,26 @@ func (m *Memberlist) suspectNode(s *suspect) {
 	// relationship with our peers, we set up k such that we hit the nominal
 	// timeout two probe intervals short of what we expect given the suspicion
 	// multiplier.
+	// 设置一个 suspect 计时器。考虑到当前节点未和其它节点有任何联系，
+	// 因此初始设置的超时时间比我们预期的超时时间短两个探测间隔(给定怀疑乘数)
 	k := m.config.SuspicionMult - 2
 
 	// If there aren't enough nodes to give the expected confirmations, just
 	// set k to 0 to say that we don't expect any. Note we subtract 2 from n
 	// here to take out ourselves and the node being probed.
+	// 但若发现集群中的节点（除自身和目标节点处）还小于 k，则直接将 k 设置为 0，以表明我们不期待任何的针对目标节点的 Confirm 操作。
 	n := m.estNumNodes()
 	if n-2 < k {
 		k = 0
 	}
 
 	// Compute the timeouts based on the size of the cluster.
+	// 基于集群的大小以及其它超时参数来计算 suspect 定时器的超时时限的上下限。
 	min := suspicionTimeout(m.config.SuspicionMult, n, m.config.ProbeInterval)
 	max := time.Duration(m.config.SuspicionMaxTimeoutMult) * min
+	// 构建基于其它节点对目标节点的 suspect 状态进行 Confirm 操作处理完成，或者达到超时时间的处理器。
+	// 此时已基本可确认目标被 suspect 节点已经处于 dead 状态了。因此，
+	// 将构建一个针对目标被 suspect 的节点的 dead 消息，然后执行对应的处理流程。
 	fn := func(numConfirmations int) {
 		var d *dead
 
@@ -1219,35 +1268,44 @@ func (m *Memberlist) suspectNode(s *suspect) {
 			m.deadNode(d)
 		}
 	}
+	// 为该目标节点构建 suspect 超时定时器，并保存
 	m.nodeTimers[s.Node] = newSuspicion(s.From, k, min, max, fn)
 }
 
 // deadNode is invoked by the network layer when we get a message
 // about a dead node
+// dead 消息的处理逻辑。
 func (m *Memberlist) deadNode(d *dead) {
 	m.nodeLock.Lock()
 	defer m.nodeLock.Unlock()
 	state, ok := m.nodeMap[d.Node]
 
 	// If we've never heard about this node before, ignore it
+	// 若该节点不存在于节点的本地集群成员视图中，则直接忽略它，不予处理。
 	if !ok {
 		return
 	}
 
 	// Ignore old incarnation numbers
+	// 若该节点的 incarnation 值要小于本节点为其存在的 incarnation 值，则同样不予处理。
 	if d.Incarnation < state.Incarnation {
 		return
 	}
 
 	// Clear out any suspicion timer that may be in effect.
+	// 否则，首先清除本节点为目标节点设置的 suspect 定时器。
 	delete(m.nodeTimers, d.Node)
 
 	// Ignore if node is already dead
+	// 若目标节点已处于 dead 或 left 状态，则直接忽略本消息。
 	if state.DeadOrLeft() {
 		return
 	}
 
 	// Check if this is us
+	// 节点会判断此 deadMsg 的目标成员是否即为自身，
+	// 若发现当前的 deadMsg 确实针对的是节点自身，且节点自身仍处于存活状态（未宕机），
+	// 因此，会进入驳斥怀疑的流程，即向集群广播 alive 消息，同时更新自身的 local health 值，然后返回。
 	if state.Name == m.config.Name {
 		// If we are not leaving we need to refute
 		if !m.hasLeft() {
@@ -1257,6 +1315,11 @@ func (m *Memberlist) deadNode(d *dead) {
 		}
 
 		// If we are leaving, we broadcast and wait
+		// 另一种情况是，节点主动调用 Leave 离开集群，
+		// 则此时可进一步广播此 dead 消息，以让其他成员尽可能快的知悉这一消息，使得集群状态收敛。
+		// 同时设置一个接收 channel，一旦任意一个成员收到此 dead 消息，此节点就可以放心离开集群，
+		// 否则应该在 Leave 操作中阻塞等待，直到集群成员知悉其已离开集群。
+		// 然后，将节点状态标记为 Left（正常离开）。
 		m.encodeBroadcastNotify(d.Node, deadMsg, d, m.leaveBroadcast)
 	} else {
 		m.encodeAndBroadcast(d.Node, deadMsg, d)
@@ -1266,10 +1329,14 @@ func (m *Memberlist) deadNode(d *dead) {
 	metrics.IncrCounter([]string{"memberlist", "msg", "dead"}, 1)
 
 	// Update the state
+	// 更新本节点为目标节点保存的 incarnation 值。
 	state.Incarnation = d.Incarnation
 
 	// If the dead message was send by the node itself, mark it is left
 	// instead of dead.
+	// 否则，若 dead 消息的节点即为发送该 dead 消息的节点，则说明该节点为主动离开集群。
+	// 因此，需要将节点的状态标记为 Left 而并非 Dead，反之亦然。
+	// 最后，更新本节点为目标节点保存的视图，比如节点状态的更新时间。
 	if d.Node == d.From {
 		state.State = StateLeft
 	} else {
@@ -1278,6 +1345,7 @@ func (m *Memberlist) deadNode(d *dead) {
 	state.StateChange = time.Now()
 
 	// Notify of death
+	// 最后回调上层应用针对节点离开集群的事件设置的 hook。
 	if m.config.Events != nil {
 		m.config.Events.NotifyLeave(&state.Node)
 	}
@@ -1285,6 +1353,9 @@ func (m *Memberlist) deadNode(d *dead) {
 
 // mergeState is invoked by the network layer when we get a Push/Pull
 // state transfer
+// 当节点通过 push->pull->merge 操作收到了目标节点集合，
+// 则遍历每一个远程节点，根据目标节点的状态来执行对应的操作。
+// 比如，目标节点处于 alive 状态，则应该执行 alive 处理器。
 func (m *Memberlist) mergeState(remote []pushNodeState) {
 	for _, r := range remote {
 		switch r.State {

@@ -7,15 +7,20 @@ package memberlist
 type EventDelegate interface {
 	// NotifyJoin is invoked when a node is detected to have joined.
 	// The Node argument must not be modified.
+	// 当节点发现有目标节点加入集群时则会触发回调该 hook。
+	// 即目标节点状态变化： dead/left -> alive
 	NotifyJoin(*Node)
 
 	// NotifyLeave is invoked when a node is detected to have left.
 	// The Node argument must not be modified.
+	// 当节点发现有目标节点离开集群时则会触发回调该 hook。
+	// 即目标节点状态变化： alive -> dead/left
 	NotifyLeave(*Node)
 
 	// NotifyUpdate is invoked when a node is detected to have
 	// updated, usually involving the meta data. The Node argument
 	// must not be modified.
+	// 当节点发现有目标节点的元素信息（ip地址、端口等）发生变更时则会触发回调该 hook。
 	NotifyUpdate(*Node)
 }
 

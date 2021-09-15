@@ -473,12 +473,16 @@ func (m *Memberlist) packetHandler() {
 				from := msg.from
 				// 根据消息的类型调用对应的处理器
 				switch msgType {
+				// suspect 消息。
 				case suspectMsg:
 					m.handleSuspect(buf, from)
+				// alive 消息。
 				case aliveMsg:
 					m.handleAlive(buf, from)
+				// dead 消息。
 				case deadMsg:
 					m.handleDead(buf, from)
+				// 用户自定义消息。
 				case userMsg:
 					m.handleUser(buf, from)
 				default:
