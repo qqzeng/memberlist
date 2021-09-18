@@ -939,6 +939,7 @@ func (m *Memberlist) sendAndReceiveState(a Address, join bool) ([]pushNodeState,
 	metrics.IncrCounter([]string{"memberlist", "tcp", "connect"}, 1)
 
 	// Send our state
+	// 在 push 操作中，节点将自身本地的集群成员视图发送给对应节点
 	if err := m.sendLocalState(conn, join); err != nil {
 		return nil, nil, err
 	}
@@ -964,6 +965,7 @@ func (m *Memberlist) sendAndReceiveState(a Address, join bool) ([]pushNodeState,
 	}
 
 	// Read remote state
+	// 在 pull 操作中，节点从连接的响应中读取远程节点的集群视图状态
 	_, remoteNodes, userState, err := m.readRemoteState(bufConn, dec)
 	return remoteNodes, userState, err
 }
@@ -1227,6 +1229,7 @@ func (m *Memberlist) mergeRemoteState(join bool, remoteNodes []pushNodeState, us
 	m.mergeState(remoteNodes)
 
 	// Invoke the delegate for user state
+	// 回调上层应用的 Merge hook。
 	if userBuf != nil && m.config.Delegate != nil {
 		m.config.Delegate.MergeRemoteState(userBuf, join)
 	}

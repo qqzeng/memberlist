@@ -102,21 +102,28 @@ func (f NoPingResponseError) Error() string {
 // Schedule is used to ensure the Tick is performed periodically. This
 // function is safe to call multiple times. If the memberlist is already
 // scheduled, then it won't do anything.
+// schedule 方法执行一些周期性触发的动作，可调用多次。具体包括三个方面：
+// 1. 随机从本地集群成员视图列表中选择一个集群成员，执行故障检测的过程；
+// 2. 随机选择一个集群成员，执行全量状态同步交换的过程;
+// 3. 随机选择若干个集群成员，执行基于 gossip 传播方式的消息传播过程。
 func (m *Memberlist) schedule() {
 	m.tickerLock.Lock()
 	defer m.tickerLock.Unlock()
 
 	// If we already have tickers, then don't do anything, since we're
 	// scheduled
+	// 保证只被调用一次
 	if len(m.tickers) > 0 {
 		return
 	}
 
 	// Create the stop tick channel, a blocking channel. We close this
 	// when we should stop the tickers.
+	// 创建定时任务取消通道
 	stopCh := make(chan struct{})
 
 	// Create a new probeTicker
+	// 创建定时探测任务，执行故障检测的过程
 	if m.config.ProbeInterval > 0 {
 		t := time.NewTicker(m.config.ProbeInterval)
 		go m.triggerFunc(m.config.ProbeInterval, t.C, stopCh, m.probe)
@@ -124,11 +131,13 @@ func (m *Memberlist) schedule() {
 	}
 
 	// Create a push pull ticker if needed
+	// 创建定时全量状态同步交换任务，执行集群中节点间数据同步交换过程
 	if m.config.PushPullInterval > 0 {
 		go m.pushPullTrigger(stopCh)
 	}
 
 	// Create a gossip ticker if needed
+	// 创建定时基于 gossip 传播方式的消息传播任务，执行基于 gossip 传播的消息广播过程
 	if m.config.GossipInterval > 0 && m.config.GossipNodes > 0 {
 		t := time.NewTicker(m.config.GossipInterval)
 		go m.triggerFunc(m.config.GossipInterval, t.C, stopCh, m.gossip)
@@ -144,6 +153,7 @@ func (m *Memberlist) schedule() {
 
 // triggerFunc is used to trigger a function call each time a
 // message is received until a stop tick arrives.
+// triggerFunc 定时执行传入的操作函数，同时会随机一个开始时间戳
 func (m *Memberlist) triggerFunc(stagger time.Duration, C <-chan time.Time, stop <-chan struct{}, f func()) {
 	// Use a random stagger to avoid syncronizing
 	randStagger := time.Duration(uint64(rand.Int63()) % uint64(stagger))
@@ -166,6 +176,8 @@ func (m *Memberlist) triggerFunc(stagger time.Duration, C <-chan time.Time, stop
 // a stop tick arrives. We don't use triggerFunc since the push/pull
 // timer is dynamically scaled based on cluster size to avoid network
 // saturation
+// pushPullTrigger 用于周期性的触发执行 push->pull->merge 的操作直至定时器被取消。
+// 定时器的超时时限是动态变化的。
 func (m *Memberlist) pushPullTrigger(stop <-chan struct{}) {
 	interval := m.config.PushPullInterval
 
@@ -179,6 +191,8 @@ func (m *Memberlist) pushPullTrigger(stop <-chan struct{}) {
 
 	// Tick using a dynamic timer
 	for {
+		// 基于集群规模，动态计算超时时间
+		// 一种直观的解释是，当集群成员数目增多时，我们需要扩大同步周期，以避免整个集群网络中充斥着大量的消息。
 		tickTime := pushPullScale(interval, m.estNumNodes())
 		select {
 		case <-time.After(tickTime):
@@ -212,19 +226,23 @@ func (m *Memberlist) deschedule() {
 }
 
 // Tick is used to perform a single round of failure detection and gossip
+// 节点故障检测和探测结果的 gossip 传播
 func (m *Memberlist) probe() {
 	// Track the number of indexes we've considered probing
+	// numCheck 存储了本次探测尝试的次数，考虑到某些情况下被随机选中的探测节点不会被执行探测过程，因此需要重新选择
 	numCheck := 0
 START:
 	m.nodeLock.RLock()
 
 	// Make sure we don't wrap around infinitely
+	// 若执行探测的尝试次数达到了节点数目，则直接退出，以保证我们不会无限的探测下去。
 	if numCheck >= len(m.nodes) {
 		m.nodeLock.RUnlock()
 		return
 	}
 
 	// Handle the wrap around case
+	// 若随机的探测索引值超过了节点列表的最大索引值，则先删除 dead 的节点，然后打散本地节点列表，再重新尝试探测
 	if m.probeIndex >= len(m.nodes) {
 		m.nodeLock.RUnlock()
 		m.resetNodes()
@@ -237,6 +255,7 @@ START:
 	skip := false
 	var node nodeState
 
+	// 跳过自身节点的探测、dead 节点和 left 节点的探测
 	node = *m.nodes[m.probeIndex]
 	if node.Name == m.config.Name {
 		skip = true
@@ -253,6 +272,7 @@ START:
 	}
 
 	// Probe the specific node
+	// 真正执行探测指定节点的过程
 	m.probeNode(&node)
 }
 
@@ -281,18 +301,23 @@ func failedRemote(err error) bool {
 }
 
 // probeNode handles a single round of failure checking on a node.
+// probeNode 对指定节点执行故障探测的过程
 func (m *Memberlist) probeNode(node *nodeState) {
 	defer metrics.MeasureSince([]string{"memberlist", "probeNode"}, time.Now())
 
 	// We use our health awareness to scale the overall probe interval, so we
 	// slow down if we detect problems. The ticker that calls us can handle
 	// us running over the base interval, and will skip missed ticks.
+	// 探测超时时间是动态设置的，同节点的 local health 成正相关，
+	// 一个直观的解释是，节点的 local health 值越高，其越可能处于高负载状态，
+	// 因此，为了顺利接收到其他成员反馈给他的消息，他需要给与目标成员更多的响应时间。
 	probeInterval := m.awareness.ScaleTimeout(m.config.ProbeInterval)
 	if probeInterval > m.config.ProbeInterval {
 		metrics.IncrCounter([]string{"memberlist", "degraded", "probe"}, 1)
 	}
 
 	// Prepare a ping message and setup an ack handler.
+	// 构建一个 ping 消息，以及设置消息被 ack 的处理器
 	selfAddr, selfPort := m.getAdvertise()
 	ping := ping{
 		SeqNo:      m.nextSeqNo(),
@@ -315,6 +340,7 @@ func (m *Memberlist) probeNode(node *nodeState) {
 	// Send a ping to the node. If this node looks like it's suspect or dead,
 	// also tack on a suspect message so that it has a chance to refute as
 	// soon as possible.
+	// 记录 ping 消息的开始发送时间，以及 ack 消息的超时时间戳
 	deadline := sent.Add(probeInterval)
 	addr := node.Address()
 
@@ -323,6 +349,7 @@ func (m *Memberlist) probeNode(node *nodeState) {
 	defer func() {
 		m.awareness.ApplyDelta(awarenessDelta)
 	}()
+	// 若节点处于 Alive 状态，则向其发送一个 ping 消息，且此基于 udp 的 pingMsg 会通过 piggyback 操作发送出去。
 	if node.State == StateAlive {
 		if err := m.encodeAndSendMsg(node.FullAddress(), pingMsg, &ping); err != nil {
 			m.logger.Printf("[ERR] memberlist: Failed to send ping: %s", err)
@@ -333,6 +360,9 @@ func (m *Memberlist) probeNode(node *nodeState) {
 			}
 		}
 	} else {
+		// 否则，即节点不处于 Alive 状态，则以 ping 消息和 suspect 消息构建一个 compound 消息，然后直接通过 udp 发送出去。
+		// 直接发送出去的原因是，考虑到目标节点可能并非处于不健康的状态，因此需要尽快纠正此现象，而不是使用基于 gossip 的消息广播的方式，
+		// 该方法需要更多的时间才能使得消息被目标节点接收。
 		var msgs [][]byte
 		if buf, err := encode(pingMsg, &ping); err != nil {
 			m.logger.Printf("[ERR] memberlist: Failed to encode ping message: %s", err)
@@ -364,9 +394,14 @@ func (m *Memberlist) probeNode(node *nodeState) {
 	// which will improve our health until we get to the failure scenarios
 	// at the end of this function, which will alter this delta variable
 	// accordingly.
+	// 更新自身的 awareness 值。考虑到，此时节点已成功发送了 ping 消息，因此后续任何的中断都表明探测动作
+	// 已经成功执行，这表明节点自身是健康的，因此，需要更新（提升）节点的健康值。
 	awarenessDelta = -1
 
 	// Wait for response or round-trip-time.
+	// 等待目标节点响应或者定时器超时，
+	// 若目标探测节点成功返回 ack，则在回调上层应用的 Complete hook 后，直接退出后续处理流程。
+	// 否则若节点响应 nack 或定时器超时后，则继续后续的间接探测过程。
 	select {
 	case v := <-ackCh:
 		if v.Complete == true {
@@ -379,6 +414,7 @@ func (m *Memberlist) probeNode(node *nodeState) {
 
 		// As an edge case, if we get a timeout, we need to re-enqueue it
 		// here to break out of the select below.
+		// 尽管节点响应超时，仍然需要将该消息入队，不然后续取不出来。
 		if v.Complete == false {
 			ackCh <- v
 		}
@@ -389,10 +425,17 @@ func (m *Memberlist) probeNode(node *nodeState) {
 		// probe interval it will give the TCP fallback more time, which
 		// is more active in dealing with lost packets, and it gives more
 		// time to wait for indirect acks/nacks.
+		// 注意：在超时后，不会加大超时时间然后重试。
+		// 这是因为我们不期望仅通过一次 udp 尝试就使得探测成功。
+		// 相反，后续我们将采用 tcp 的方式来继续尝试探测。因为，对于 tcp 的探测方式，
+		// 基于节点的健康度可以增加更大的超时时限，这能更好的处理由于网络波动而丢包的情况，
+		// 同时也给予我们更多的时间来等待目标节点的 ack 或者 nack 消息。
 		m.logger.Printf("[DEBUG] memberlist: Failed ping: %s (timeout reached)", node.Name)
 	}
 
 HANDLE_REMOTE_FAILURE:
+	// 或是探测失败是由远程目标节点导致的，则开始执行间接探测流程。
+	// 首先从本地集群成员视图中选择 k 个成员，要求被选中的成员不能是自身，且必须处于 alive 状态。
 	// Get some random live nodes.
 	m.nodeLock.RLock()
 	kNodes := kRandomNodes(m.config.IndirectChecks, m.nodes, func(n *nodeState) bool {
@@ -403,6 +446,7 @@ HANDLE_REMOTE_FAILURE:
 	m.nodeLock.RUnlock()
 
 	// Attempt an indirect ping.
+	// 尝试执行一个间接探测，即向他们发送基于 udp 的 indirectPing 消息。
 	expectedNacks := 0
 	selfAddr, selfPort = m.getAdvertise()
 	ind := indirectPingReq{
@@ -436,8 +480,11 @@ HANDLE_REMOTE_FAILURE:
 	// member who understands version 3 of the protocol, regardless of
 	// which protocol version we are speaking. That's why we've included a
 	// config option to turn this off if desired.
+	// 上面提到，当 udp 直接探测失败时，会转向使用 tcp 来重试。
+	// 这当对端的网络被错误配置为禁止 udp 包，而允许 tcp 包时会有效。
 	fallbackCh := make(chan bool, 1)
 
+	// 只要没有配置禁止使用 tcp 探测，就转向使用 tcp 向目标节点发送 ping
 	disableTcpPings := m.config.DisableTcpPings ||
 		(m.config.DisableTcpPingsForNode != nil && m.config.DisableTcpPingsForNode(node.Name))
 	if (!disableTcpPings) && (node.PMax >= 3) {
@@ -458,6 +505,9 @@ HANDLE_REMOTE_FAILURE:
 	// channel here because we want to issue a warning below if that's the
 	// *only* way we hear back from the peer, so we have to let this time
 	// out first to allow the normal UDP-based acks to come in.
+	// 等待 udp 探测请求响应或者超时（v.Complete = false）。
+	// 这里没有检测 tcp 请求的响应，因为，即使 tcp 响应成功，对端也属于不太正常的情况。
+	// 因此需要给出 warning。
 	select {
 	case v := <-ackCh:
 		if v.Complete == true {
@@ -468,6 +518,7 @@ HANDLE_REMOTE_FAILURE:
 	// Finally, poll the fallback channel. The timeouts are set such that
 	// the channel will have something or be closed without having to wait
 	// any additional time here.
+	// 最后，轮询等从 fallback 通道中读取响应，或者超时返回。
 	for didContact := range fallbackCh {
 		if didContact {
 			m.logger.Printf("[WARN] memberlist: Was able to connect to %s but other probes failed, network may be misconfigured", node.Name)
@@ -482,6 +533,8 @@ HANDLE_REMOTE_FAILURE:
 	// health because we assume them to be working, and they can help us
 	// decide if the probed node was really dead or if it was something wrong
 	// with ourselves.
+	// 当探测失败时，更新自身的 awareness 值。
+	// 需要注意的是，间接探测返回的 nack 数目同 awareness 值的更新密切相关。
 	awarenessDelta = 0
 	if expectedNacks > 0 {
 		if nackCount := len(nackCh); nackCount < expectedNacks {
@@ -492,6 +545,8 @@ HANDLE_REMOTE_FAILURE:
 	}
 
 	// No acks received from target, suspect it as failed.
+	// 若通过 tcp 也探测失败，则说明目标节点可能发生故障，
+	// 因此，首先更新节点自身的 local health 值，然后进入到怀疑节点（suspectNode）的操作流程
 	m.logger.Printf("[INFO] memberlist: Suspect %s has failed, no acks received", node.Name)
 	s := suspect{Incarnation: node.Incarnation, Node: node.Name, From: m.config.Name}
 	m.suspectNode(&s)
@@ -539,35 +594,43 @@ func (m *Memberlist) Ping(node string, addr net.Addr) (time.Duration, error) {
 
 // resetNodes is used when the tick wraps around. It will reap the
 // dead nodes and shuffle the node list.
+// resetNodes 回收节点本地视图中的 dead 节点，并打散节点本地视图集的节点索引
 func (m *Memberlist) resetNodes() {
 	m.nodeLock.Lock()
 	defer m.nodeLock.Unlock()
 
 	// Move dead nodes, but respect gossip to the dead interval
+	// moveDeadNodes 将本地视图中的 dead 节点（且 gossip 时间小于状态变更的时间）移动节点列表的末尾，以便于后续的截取操作
 	deadIdx := moveDeadNodes(m.nodes, m.config.GossipToTheDeadTime)
 
 	// Deregister the dead nodes
+	// 将 daed 节点在本地集群成员视图中删除
 	for i := deadIdx; i < len(m.nodes); i++ {
 		delete(m.nodeMap, m.nodes[i].Name)
 		m.nodes[i] = nil
 	}
 
 	// Trim the nodes to exclude the dead nodes
+	// 将 dead 节点从列表末端中移除
 	m.nodes = m.nodes[0:deadIdx]
 
 	// Update numNodes after we've trimmed the dead nodes
+	// 更新集群中节点数目
 	atomic.StoreUint32(&m.numNodes, uint32(deadIdx))
 
 	// Shuffle live nodes
+	// 打散节点保存的本地集群节点列表
 	shuffleNodes(m.nodes)
 }
 
 // gossip is invoked every GossipInterval period to broadcast our gossip
 // messages to a few random nodes.
+// gossip 函数用于定期地广播 gossip 消息给随机中随机的 k 个节点
 func (m *Memberlist) gossip() {
 	defer metrics.MeasureSince([]string{"memberlist", "gossip"}, time.Now())
 
 	// Get some random live, suspect, or recently dead nodes
+	// 随机选择节点时，只选择 alive、suspect 以及部分 dead 节点。
 	m.nodeLock.RLock()
 	kNodes := kRandomNodes(m.config.GossipNodes, m.nodes, func(n *nodeState) bool {
 		if n.Name == m.config.Name {
@@ -593,8 +656,10 @@ func (m *Memberlist) gossip() {
 		bytesAvail -= encryptOverhead(m.encryptionVersion())
 	}
 
+	// 从广播消息队列中取出若干消息，以构成 compound 消息，然后依次向他们发送此 compound 消息。
 	for _, node := range kNodes {
 		// Get any pending broadcasts
+		// 从缓冲队列中选择总容量固定的消息集合
 		msgs := m.getBroadcasts(compoundOverhead, bytesAvail)
 		if len(msgs) == 0 {
 			return
@@ -620,6 +685,13 @@ func (m *Memberlist) gossip() {
 // exchange. Used to ensure a high level of convergence, but is also
 // reasonably expensive as the entire state of this node is exchanged
 // with the other node.
+// pushPull 执行一个节点全量状态交换的操作以交换节点同集群其他成员的集群节点成员视图状态。
+// 该操作比较耗时。
+// 即随机选择 k 个节点进行节点之间的全量状态交换。
+// 此操作的目的是加速集群状态收敛，不必使用基于 gossip 的消息传播方式，
+// 这在新节点加入集群，或者整个集群出现网络分区恢复的场景尤为有效。
+// 此操作的一个代价是网络带宽，
+// 因此，显然此操作不能过于频繁，特别是在集群规模较大的情况
 func (m *Memberlist) pushPull() {
 	// Get a random live node
 	m.nodeLock.RLock()
@@ -646,11 +718,14 @@ func (m *Memberlist) pushPullNode(a Address, join bool) error {
 	defer metrics.MeasureSince([]string{"memberlist", "pushPullNode"}, time.Now())
 
 	// Attempt to send and receive with the node
+	// 首先，针对选中的节点执行 push->pull 操作。
+	// push 和 pull 操作都基于 tcp 连接
 	remote, userState, err := m.sendAndReceiveState(a, join)
 	if err != nil {
 		return err
 	}
 
+	// 执行节点状态数据的合并操作
 	if err := m.mergeRemoteState(join, remote, userState); err != nil {
 		return err
 	}
@@ -806,6 +881,7 @@ type ackMessage struct {
 // with a given sequence number is received. The `complete` field of the message
 // will be false on timeout. Any nack messages will cause an empty struct to be
 // passed to the nackCh, which can be nil if not needed.
+// setProbeChannels 设置 ping 消息被 ack 或者 nack 的处理器，同时，当超时未回复时，则删除对应的处理器
 func (m *Memberlist) setProbeChannels(seqNo uint32, ackCh chan ackMessage, nackCh chan struct{}, timeout time.Duration) {
 	// Create handler functions for acks and nacks
 	ackFn := func(payload []byte, timestamp time.Time) {
@@ -1373,6 +1449,8 @@ func (m *Memberlist) mergeState(remote []pushNodeState) {
 		case StateLeft:
 			d := dead{Incarnation: r.Incarnation, Node: r.Name, From: r.Name}
 			m.deadNode(&d)
+		// 需要注意的是，即使节点的状态为 dead，其仍然选择通过发送 suspect 消息，
+		// 以给与节点驳斥怀疑的机会，而不是直接将节点标记为 Dead 并广播 dead 消息。
 		case StateDead:
 			// If the remote node believes a node is dead, we prefer to
 			// suspect that node instead of declaring it dead instantly

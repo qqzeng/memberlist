@@ -7,6 +7,7 @@ type Delegate interface {
 	// NodeMeta is used to retrieve meta-data about the current node
 	// when broadcasting an alive message. It's length is limited to
 	// the given byte size. This metadata is available in the Node structure.
+	// NodeMeta 用于供上层应用向 alive 消息注入节点元数据。
 	NodeMeta(limit int) []byte
 
 	// NotifyMsg is called when a user-data message is received.

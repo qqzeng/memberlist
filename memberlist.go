@@ -413,6 +413,7 @@ func (m *Memberlist) resolveAddr(hostStr string) ([]ipPort, error) {
 // setAlive is used to mark this node as being alive. This is the same
 // as if we received an alive notification our own network channel for
 // ourself.
+// setAlive 方法标记当前节点为 alive 状态。其作用类似于从网络中收到一条针对自身的 alive 消息。
 func (m *Memberlist) setAlive() error {
 	// Get the final advertise address from the transport, which may need
 	// to see which address we bound to.
@@ -445,6 +446,7 @@ func (m *Memberlist) setAlive() error {
 		}
 	}
 
+	// 构建一条 alive　消息，然后进入 alive 消息的处理逻辑。
 	a := alive{
 		Incarnation: m.nextIncarnation(),
 		Node:        m.config.Name,
